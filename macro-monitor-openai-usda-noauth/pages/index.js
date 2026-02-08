@@ -1,0 +1,1 @@
+export default function Home(){return <div style={{padding:40}}>Macro Monitor deployed (no-auth build).</div>}
