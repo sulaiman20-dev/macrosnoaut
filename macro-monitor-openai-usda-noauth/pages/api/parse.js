@@ -1,3 +1,17 @@
+export default async function handler(req, res) {
+  res.setHeader("Content-Type", "application/json");
+  if (req.method !== "POST") {
+    return res.status(405).json({
+      error: "Method not allowed",
+      gotMethod: req.method,
+      headers: req.headers?.["content-type"] || null,
+    });
+  }
+  // ...rest of your existing code...
+}
+
+
+
 import OpenAI from "openai";
 import { estimateGrams, roundItem, toNumber } from "../../lib/normalize.js";
 import { usdaSearchFood, usdaGetFoodPer100 } from "../../lib/usda.js";
