@@ -272,12 +272,24 @@ export default function Home() {
     setStatus(null);
     setParsing(true);
     try {
-      const res = await fetch("/api/parse", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: input.trim() }),
-      });
-      const j = await res.json();
+     const res = await fetch("/api/parse", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ text: input.trim() }),
+});
+
+let j;
+const textRes = await res.text();
+try {
+  j = JSON.parse(textRes);
+} catch {
+  throw new Error(`API error (${res.status}): ${textRes || "empty response"}`);
+}
+
+if (!res.ok) {
+  throw new Error(j?.error || "Parse failed");
+}
+
       if (!res.ok) throw new Error(j?.error || "Parse failed");
 
       const newItems = (Array.isArray(j.items) ? j.items : []).map((it, idx) => ({
