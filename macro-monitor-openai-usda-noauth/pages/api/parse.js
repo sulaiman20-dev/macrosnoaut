@@ -104,8 +104,37 @@ GUIDELINES:
     throw new Error(j?.error?.message || `OpenAI error ${resp.status}`);
   }
 
-  const out = String(j?.output_text || "").trim();
-  if (!out) throw new Error("OpenAI returned empty output_text");
+   // Responses API sometimes doesn't populate output_text.
+  // Extract text from output[] blocks instead.
+  const extractText = (respJson) => {
+    // Preferred: output_text if present
+    if (typeof respJson?.output_text === "string" && respJson.output_text.trim()) {
+      return respJson.output_text.trim();
+    }
+
+    const outs = Array.isArray(respJson?.output) ? respJson.output : [];
+    let buf = "";
+
+    for (const o of outs) {
+      const content = Array.isArray(o?.content) ? o.content : [];
+      for (const c of content) {
+        // Common shapes:
+        // { type: "output_text", text: "..." }
+        // { type: "text", text: "..." }
+        if (typeof c?.text === "string") buf += c.text;
+        if (typeof c?.content === "string") buf += c.content;
+      }
+    }
+
+    return buf.trim();
+  };
+
+  const out = extractText(j);
+  if (!out) {
+    throw new Error(
+      `OpenAI returned no text. Raw keys: ${Object.keys(j || {}).join(", ")}`
+    );
+  }
 
   // Extract JSON object if model added extra text
   let jsonStr = out;
