@@ -1,356 +1,223 @@
 // pages/api/parse.js
-// OpenAI + USDA parser (no response_format)
-// Requires env vars:
+// Next.js API route: POST /api/parse
+//
+// Env vars required on Vercel:
 // - OPENAI_API_KEY
-// - USDA_API_KEY
+// - USDA_API_KEY   (optional if you use USDA later in this route; kept for compatibility)
 
-const OPENAI_MODEL = "gpt-5-mini";
+const OPENAI_URL = "https://api.openai.com/v1/responses";
+const MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
 
-function num(x, d = 0) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : d;
-}
-function round1(x) {
-  return Math.round(num(x) * 10) / 10;
-}
-function clamp(x, lo, hi) {
-  x = num(x);
-  return Math.max(lo, Math.min(hi, x));
-}
-
-function sumItems(items) {
-  const Z = {
-    calories: 0,
-    protein: 0,
-    fat: 0,
-    carbs: 0,
-    fiber: 0,
-    sodium: 0,
-    potassium: 0,
-    magnesium: 0,
-  };
-  for (const it of items) {
-    for (const k of Object.keys(Z)) Z[k] += num(it[k]);
+function extractResponseText(respJson) {
+  // 1) preferred if present
+  if (typeof respJson?.output_text === "string" && respJson.output_text.trim()) {
+    return respJson.output_text.trim();
   }
-  for (const k of Object.keys(Z)) Z[k] = round1(Z[k]);
-  return Z;
+
+  // 2) canonical: iterate output[].content[].text
+  const outs = Array.isArray(respJson?.output) ? respJson.output : [];
+  let buf = "";
+  for (const o of outs) {
+    const content = Array.isArray(o?.content) ? o.content : [];
+    for (const c of content) {
+      if (typeof c?.text === "string") buf += c.text;
+      if (typeof c?.content === "string") buf += c.content;
+    }
+  }
+  return buf.trim();
 }
 
-// ---------- OpenAI: turn text into { items: [{name, query, grams|null, count|null, unit|null}] } ----------
+function stripCodeFences(s) {
+  // removes ```json ... ``` or ``` ... ```
+  return s
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```$/i, "")
+    .trim();
+}
 
-async function openaiParse(text) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error("OPENAI_API_KEY is not set");
+function tryParseJson(text) {
+  const cleaned = stripCodeFences(String(text || "").trim());
 
-  const system = `
-You are a nutrition parsing assistant.
+  // First attempt: direct parse
+  try {
+    return JSON.parse(cleaned);
+  } catch {}
 
-TASK:
-Extract foods and amounts from user text into a JSON object.
+  // Fallback: extract first JSON object/array from text
+  const s = cleaned;
 
-OUTPUT RULES (CRITICAL):
-- Return ONLY valid JSON.
-- No markdown, no commentary, no backticks.
-- Must match the schema exactly.
+  // Find first "{" or "[" and attempt to parse balanced chunk
+  const startObj = s.indexOf("{");
+  const startArr = s.indexOf("[");
+  let start = -1;
+  if (startObj === -1) start = startArr;
+  else if (startArr === -1) start = startObj;
+  else start = Math.min(startObj, startArr);
 
-SCHEMA:
+  if (start === -1) {
+    throw new Error("No JSON object/array found in model output");
+  }
+
+  const opener = s[start];
+  const closer = opener === "{" ? "}" : "]";
+
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+
+    if (inStr) {
+      if (esc) {
+        esc = false;
+      } else if (ch === "\\") {
+        esc = true;
+      } else if (ch === '"') {
+        inStr = false;
+      }
+      continue;
+    } else {
+      if (ch === '"') {
+        inStr = true;
+        continue;
+      }
+    }
+
+    if (ch === opener) depth++;
+    if (ch === closer) depth--;
+
+    if (depth === 0) {
+      const candidate = s.slice(start, i + 1);
+      try {
+        return JSON.parse(candidate);
+      } catch (e) {
+        throw new Error(
+          `Found JSON-like block but JSON.parse failed: ${e?.message || e}`
+        );
+      }
+    }
+  }
+
+  throw new Error("Unbalanced JSON in model output");
+}
+
+export default async function handler(req, res) {
+  res.setHeader("Content-Type", "application/json");
+
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+
+  try {
+    const { text } = req.body || {};
+    const input = String(text || "").trim();
+
+    if (!input) {
+      return res.status(400).json({ error: "Missing 'text' in request body" });
+    }
+
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: "Missing OPENAI_API_KEY env var" });
+    }
+
+    // We tell the model to return JSON ONLY (no prose).
+    const system = `
+You are a nutrition logging parser.
+Return ONLY valid JSON. No markdown. No code fences. No commentary.
+Schema:
 {
   "items": [
     {
-      "name": "short user-facing label",
-      "query": "USDA search query string",
-      "grams": number|null,
-      "count": number|null,
-      "unit": string|null
+      "query": string,              // short search phrase for USDA (e.g., "large egg", "raw spinach")
+      "display": string,            // user-friendly name
+      "quantity": number,           // numeric quantity
+      "unit": string,               // e.g., "egg", "g", "oz", "cup", "tbsp", "tsp", "serving"
+      "notes": string|null          // optional extra context (brand, "cooked", etc)
     }
   ]
 }
-
-GUIDELINES:
-- Split compound inputs into multiple items (eggs, spinach, onions, yogurt, blueberries).
-- If user gives a count and a common unit (e.g. "3 eggs"), set count=3, unit="egg", grams=null.
-- If user gives grams (e.g. "30g blueberries"), set grams=30, count=null, unit="g" (or null).
-- For packaged foods (e.g. "Chobani Zero Sugar yogurt"), keep query close to brand/product.
-- Keep items <= 12.
+If the input is ambiguous, make a best guess and put uncertainty in "notes".
 `;
 
-  const body = {
-    model: OPENAI_MODEL,
-    input: [
-      { role: "system", content: system },
-      { role: "user", content: text },
-    ],
-    max_output_tokens: 700,
-  };
+    const payload = {
+      model: MODEL,
+      input: [
+        { role: "system", content: system.trim() },
+        { role: "user", content: input },
+      ],
+      // Keep it small and deterministic for a parser
+      temperature: 0.2,
+      max_output_tokens: 600,
+    };
 
-  const resp = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+    const r = await fetch(OPENAI_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
 
-  const raw = await resp.text();
-  let j;
-  try {
-    j = JSON.parse(raw);
-  } catch {
-    throw new Error(`OpenAI non-JSON response (${resp.status}): ${raw.slice(0, 200)}`);
-  }
-
-  if (!resp.ok) {
-    throw new Error(j?.error?.message || `OpenAI error ${resp.status}`);
-  }
-
-   // Responses API sometimes doesn't populate output_text.
-  // Extract text from output[] blocks instead.
-  const extractText = (respJson) => {
-    // Preferred: output_text if present
-    if (typeof respJson?.output_text === "string" && respJson.output_text.trim()) {
-      return respJson.output_text.trim();
+    const raw = await r.text();
+    let j;
+    try {
+      j = JSON.parse(raw);
+    } catch (e) {
+      console.error("parse error: OpenAI non-JSON response:", raw.slice(0, 500));
+      return res.status(502).json({ error: "OpenAI returned non-JSON", raw });
     }
 
-    const outs = Array.isArray(respJson?.output) ? respJson.output : [];
-    let buf = "";
-
-    for (const o of outs) {
-      const content = Array.isArray(o?.content) ? o.content : [];
-      for (const c of content) {
-        // Common shapes:
-        // { type: "output_text", text: "..." }
-        // { type: "text", text: "..." }
-        if (typeof c?.text === "string") buf += c.text;
-        if (typeof c?.content === "string") buf += c.content;
-      }
+    if (!r.ok) {
+      // pass through useful message
+      const msg =
+        j?.error?.message ||
+        j?.message ||
+        `OpenAI error (${r.status})`;
+      console.error("parse error: OpenAI error:", msg);
+      return res.status(r.status).json({ error: msg });
     }
 
-    return buf.trim();
-  };
-
-  const out = extractText(j);
-  if (!out) {
-    throw new Error(
-      `OpenAI returned no text. Raw keys: ${Object.keys(j || {}).join(", ")}`
-    );
-  }
-
-  // Extract JSON object if model added extra text
-  let jsonStr = out;
-  if (!out.startsWith("{")) {
-    const m = out.match(/\{[\s\S]*\}/);
-    if (!m) throw new Error(`OpenAI output not JSON: ${out.slice(0, 200)}`);
-    jsonStr = m[0];
-  }
-
-  let parsed;
-  try {
-    parsed = JSON.parse(jsonStr);
-  } catch {
-    throw new Error(`Failed to parse OpenAI JSON: ${jsonStr.slice(0, 200)}`);
-  }
-
-  if (!parsed?.items || !Array.isArray(parsed.items)) {
-    throw new Error("OpenAI parse failed: missing items[]");
-  }
-
-  // Sanitize
-  parsed.items = parsed.items
-    .slice(0, 12)
-    .map((it) => ({
-      name: String(it.name || it.query || "Item").slice(0, 120),
-      query: String(it.query || it.name || "").slice(0, 160),
-      grams:
-        it.grams === null || it.grams === undefined
-          ? null
-          : clamp(it.grams, 1, 2000),
-      count:
-        it.count === null || it.count === undefined
-          ? null
-          : clamp(it.count, 0.25, 50),
-      unit: it.unit === null || it.unit === undefined ? null : String(it.unit).slice(0, 30),
-    }))
-    .filter((it) => it.query);
-
-  return parsed;
-}
-
-// ---------- USDA helpers ----------
-
-async function usdaSearch(query, usdaKey) {
-  const url = new URL("https://api.nal.usda.gov/fdc/v1/foods/search");
-  url.searchParams.set("api_key", usdaKey);
-
-  const resp = await fetch(url.toString(), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, pageSize: 5 }),
-  });
-
-  const j = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(j?.message || `USDA search error ${resp.status}`);
-  return j?.foods || [];
-}
-
-async function usdaFoodDetails(fdcId, usdaKey) {
-  const url = new URL(`https://api.nal.usda.gov/fdc/v1/food/${fdcId}`);
-  url.searchParams.set("api_key", usdaKey);
-
-  const resp = await fetch(url.toString());
-  const j = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(j?.message || `USDA food error ${resp.status}`);
-  return j;
-}
-
-function pickBestFood(foods) {
-  if (!foods?.length) return null;
-
-  const score = (f) => {
-    const dt = String(f.dataType || "").toLowerCase();
-    let s = 0;
-    if (dt.includes("foundation")) s += 6;
-    if (dt.includes("sr")) s += 5;
-    if (dt.includes("survey")) s += 4;
-    if (dt.includes("branded")) s += 2;
-    if (Array.isArray(f.foodNutrients) && f.foodNutrients.length > 0) s += 1;
-    return s;
-  };
-
-  return foods.slice().sort((a, b) => score(b) - score(a))[0];
-}
-
-function nutrientsPer100g(foodDetail) {
-  const out = {};
-  const n = foodDetail?.foodNutrients || [];
-
-  for (const x of n) {
-    const name = String(x.nutrient?.name || "").toLowerCase();
-    const unit = String(x.nutrient?.unitName || "").toLowerCase();
-    const val = num(x.amount, null);
-    if (val == null) continue;
-
-    if (name === "energy") {
-      // energy in kcal (or kJ sometimes)
-      out.energy_kcal = unit === "kj" ? val / 4.184 : val;
-    }
-    if (name === "protein") out.protein_g = val;
-    if (name === "total lipid (fat)") out.fat_g = val;
-    if (name === "carbohydrate, by difference") out.carbs_g = val;
-    if (name === "fiber, total dietary") out.fiber_g = val;
-
-    if (name === "sodium, na") out.sodium_mg = unit === "mg" ? val : val * 1000;
-    if (name === "potassium, k") out.potassium_mg = unit === "mg" ? val : val * 1000;
-    if (name === "magnesium, mg") out.magnesium_mg = unit === "mg" ? val : val * 1000;
-  }
-
-  return out;
-}
-
-function scale(per100, grams) {
-  const f = grams / 100;
-  return {
-    calories: round1((per100.energy_kcal || 0) * f),
-    protein: round1((per100.protein_g || 0) * f),
-    fat: round1((per100.fat_g || 0) * f),
-    carbs: round1((per100.carbs_g || 0) * f),
-    fiber: round1((per100.fiber_g || 0) * f),
-    sodium: round1((per100.sodium_mg || 0) * f),
-    potassium: round1((per100.potassium_mg || 0) * f),
-    magnesium: round1((per100.magnesium_mg || 0) * f),
-  };
-}
-
-// Rough defaults when grams aren't provided
-function estimateGrams(item) {
-  const q = String(item.query || item.name || "").toLowerCase();
-  const unit = String(item.unit || "").toLowerCase();
-
-  // Eggs
-  if (unit.includes("egg") || q.includes("egg")) {
-    const c = item.count || 1;
-    return 50 * c; // ~50g per large egg
-  }
-
-  // Tbsp
-  if (unit.includes("tbsp") || unit.includes("tablespoon") || q.includes("tablespoon")) {
-    const c = item.count || 1;
-    return 15 * c;
-  }
-
-  // Cup
-  if (unit.includes("cup") || q.includes("cup")) {
-    const c = item.count || 1;
-    if (q.includes("spinach")) return 30 * c; // raw spinach is light
-    return 245 * c; // generic cup estimate
-  }
-
-  // default: 100g
-  return 100;
-}
-
-// ---------- Next.js API route ----------
-
-export default async function handler(req, res) {
-  try {
-    res.setHeader("Content-Type", "application/json");
-
-    if (req.method !== "POST") {
-      return res.status(405).json({ error: "Method not allowed", gotMethod: req.method });
+    const outText = extractResponseText(j);
+    if (!outText) {
+      console.error("parse error: OpenAI returned no text blocks", j);
+      return res.status(502).json({ error: "OpenAI returned empty text output" });
     }
 
-    const usdaKey = process.env.USDA_API_KEY;
-    if (!usdaKey) throw new Error("USDA_API_KEY is not set");
-
-    const text = String(req.body?.text || "").trim();
-    if (!text) return res.status(400).json({ error: "Missing text" });
-
-    // 1) LLM parses text into items
-    const parsed = await openaiParse(text);
-
-    // 2) USDA converts each item into nutrients
-    const outItems = [];
-    for (const it of parsed.items) {
-      const foods = await usdaSearch(it.query, usdaKey);
-      const best = pickBestFood(foods);
-
-      if (!best?.fdcId) {
-        outItems.push({
-          name: it.name,
-          calories: 0,
-          protein: 0,
-          fat: 0,
-          carbs: 0,
-          fiber: 0,
-          sodium: 0,
-          potassium: 0,
-          magnesium: 0,
-          note: "No USDA match",
-        });
-        continue;
-      }
-
-      const detail = await usdaFoodDetails(best.fdcId, usdaKey);
-      const per100 = nutrientsPer100g(detail);
-
-      const grams = it.grams ?? estimateGrams(it);
-      const scaled = scale(per100, grams);
-
-      outItems.push({
-        name: it.name,
-        ...scaled,
+    let parsed;
+    try {
+      parsed = tryParseJson(outText);
+    } catch (e) {
+      console.error("parse error: Failed to parse OpenAI JSON:", outText);
+      return res.status(502).json({
+        error: `Failed to parse OpenAI JSON: ${e?.message || e}`,
+        modelText: outText,
       });
     }
 
-    return res.status(200).json({
-      items: outItems,
-      totals: sumItems(outItems),
-    });
-  } catch (e) {
-    console.error("parse error:", e);
-    return res.status(500).json({
-      error: "Server error",
-      detail: String(e?.message || e),
-    });
+    if (!parsed || !Array.isArray(parsed.items)) {
+      return res.status(502).json({
+        error: "Model JSON missing required 'items' array",
+        modelJson: parsed,
+      });
+    }
+
+    // Basic normalization / safety
+    const items = parsed.items
+      .filter(Boolean)
+      .map((it) => ({
+        query: String(it.query || it.display || "").trim(),
+        display: String(it.display || it.query || "").trim(),
+        quantity: Number(it.quantity || 1),
+        unit: String(it.unit || "serving").trim(),
+        notes: it.notes == null ? null : String(it.notes),
+      }))
+      .filter((it) => it.query && it.display && Number.isFinite(it.quantity));
+
+    return res.status(200).json({ items });
+  } catch (err) {
+    console.error("parse error:", err);
+    return res.status(500).json({ error: err?.message || "Server error" });
   }
 }
